@@ -1,1 +1,12 @@
+// meson 
+// ninja [ninja-build]
+// valac
+// cmake
 
+> meson setup build
+> ninja -C build
+
+;; install mising >>>>
+;; > sudo apt install libgee-0.8-dev
+;; > sudo apt install libadwaita-1-dev
+;; > sudo apt install libgtk-4-dev
