@@ -1,0 +1,33 @@
+use "std -> fs" from "fs"
+
+pub struct Game is
+    pub appid:           string
+    pub name:            string
+    pub library_path:    string   ;; .../steamapps
+    pub install_dir:     string   ;; .../steamapps/common/<Nazwa>
+    pub compatdata_path: string   ;; .../steamapps/compatdata/<appid>
+    pub has_prefix:      bool
+end
+
+pub fn new_game(appid: string, name: string, library_path: string) -> Game is
+    let compat: string = library_path + "/compatdata/" + appid
+    return Game {
+        appid:           appid,
+        name:            name,
+        library_path:    library_path,
+        install_dir:     "",
+        compatdata_path: compat,
+        has_prefix:      fs::is_dir(compat + "/pfx"),
+    }
+end
+
+pub fn pfx_path(g: Game) -> string is
+    return g.compatdata_path + "/pfx"
+end
+
+pub fn display_subtitle(g: Game) -> string is
+    if g.has_prefix is
+        return "AppID " + g.appid + " • prefix obecny"
+    end
+    return "AppID " + g.appid + " • brak prefixu Proton"
+end
