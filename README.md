@@ -1,6 +1,6 @@
 # Proton Manager
 
-Narzędzie GUI (GTK4 + libadwaita, napisane w **Vala**, budowane **Meson-em**),
+Narzędzie GUI (GTK4 + libadwaita, napisane w **H#** z biblioteką **gtk** (bit.io), budowane przez **bit**),
 które łączy w sobie funkcje **Proton (GE)** i **protontricks** w jednym miejscu,
 a przede wszystkim **naprawia typowe bolączki protontricks**:
 
@@ -26,56 +26,47 @@ a przede wszystkim **naprawia typowe bolączki protontricks**:
 
 ```
 proton-manager/
-├── meson.build              # główny plik budowania
+├── Bit.hk                    # manifest bit (zależność: gtk) — zastępuje meson.build
+├── build.hl
 ├── src/
-│   ├── meson.build
-│   ├── main.vala             # punkt wejścia
-│   ├── application.vala      # Adw.Application
-│   ├── window.vala           # główne okno (lista gier + panel akcji + log)
-│   ├── game.vala             # model gry / prefixu Proton
-│   ├── steam-library.vala    # wykrywanie bibliotek Steam / gier / Protona
-│   ├── protontricks.vala     # backend protontricks + tryb bezpośredni (bypass)
-│   └── command-runner.vala   # asynchroniczne uruchamianie poleceń z logiem
+│   ├── main.h#               # punkt wejścia
+│   ├── window.h#             # główne okno (lista gier + panel akcji + log), stan Ui
+│   ├── game.h#               # model gry / prefixu Proton
+│   ├── steam_library.h#      # wykrywanie bibliotek Steam / gier / Protona
+│   ├── protontricks.h#       # backend protontricks + tryb bezpośredni (bypass)
+│   ├── command_runner.h#     # asynchroniczne uruchamianie poleceń z logiem na żywo
+│   └── ffi.h#                # dodatkowe bindingi `extern static` (libc, GTK)
 └── data/
-    ├── meson.build
     └── com.protonmanager.App.desktop.in
 ```
+
+Przepisanie z Vali: `application.vala` zniknęło (rolę `Adw.Application` pełni
+`gtk::App` z pętlą zdarzeń biblioteki gtk), pozostałe pliki mają swoje odpowiedniki
+1:1. Poza oryginałem dodano: GE-Proton z `compatibilitytools.d`, wiele verbów naraz,
+zapamiętanie wybranej wersji Protona.
 
 ## Zależności (Ubuntu/Debian)
 
 ```bash
-sudo apt install valac meson ninja-build libgtk-4-dev libadwaita-1-dev libgee-0.8-dev
+sudo apt install libgtk-4-dev libadwaita-1-dev pkg-config
 ```
 
-Do pełnej funkcjonalności w systemie potrzebne są też: `winetricks`
-(pakiet `winetricks`) oraz opcjonalnie `protontricks` (natywnie albo
-przez Flatpak `com.github.Matoking.protontricks`) — ale program **działa
-także bez protontricks**, korzystając wyłącznie z trybu bezpośredniego.
+Potrzebny jest kompilator **H#** (0.9 z obsługą domknięć — backend C++) oraz `bit`.
+Do pełnej funkcjonalności w systemie przydają się też: `winetricks` oraz opcjonalnie
+`protontricks` (natywnie albo Flatpak `com.github.Matoking.protontricks`) — program
+**działa także bez protontricks**, korzystając z trybu bezpośredniego.
 
 ## Budowanie i uruchomienie
 
 ```bash
-meson setup build
-ninja -C build
-./build/src/proton-manager
+bit                      # instaluje zależności (gtk) i buduje wg [default-build]
+./cache/build/release/proton-manager
+# albo:
+bit install-local        # instaluje binarkę i plik .desktop do /usr/local
 ```
 
-## Instalacja systemowa (opcjonalnie)
+Jeśli `bit` nie widzi własnego `h#`, wskaż go: `BIT_HSHARP=/ścieżka/do/h# bit`.
 
-```bash
-meson setup build --prefix=/usr/local
-ninja -C build
-sudo ninja -C build install
-```
+## Licencja
 
-## Jak to naprawia protontricks?
-
-Protontricks jest w praktyce cienką nakładką na `winetricks` uruchamiane
-z odpowiednimi zmiennymi środowiskowymi Steam/Proton. Gdy zawiedzie
-(np. źle rozpozna AppID, ma nieaktualną bazę Proton App ID, albo jego
-zależności Pythona są rozjechane po aktualizacji dystrybucji), zwykle
-i tak można ręcznie odtworzyć to, co próbuje zrobić — tylko trzeba pamiętać
-poprawne ścieżki i zmienne. Proton Manager robi to za Ciebie: sam wykrywa
-prefix gry i instalację Protona, sam buduje `WINEPREFIX`/`STEAM_COMPAT_*`
-i uruchamia `wine`/`winetricks`/`wineserver` bezpośrednio, z pełnym logiem
-na żywo, żebyś widział dokładnie co się dzieje zamiast walczyć z terminalem.
+Zobacz plik `LICENSE`.
