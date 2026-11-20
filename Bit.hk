@@ -1,26 +1,57 @@
-project('proton-manager', ['vala', 'c'],
-  version: '0.1.0',
-  license: 'GPL-3.0-or-later',
-  meson_version: '>= 0.60.0',
-)
+[package]
+-> name        => proton-manager
+-> version     => 0.1.0
+-> description => GTK4 + libadwaita tool for Proton and protontricks (with a direct bypass mode).
+-> authors     => ["HackerOS Team <hackeros068@gmail.com>"]
+-> license     => GPL-3.0
+-> lang        => h#
 
-gnome = import('gnome')
-i18n = import('i18n')
+[edition]
+-> edition   => 2026
+-> toolchain => 0.9
 
-dependencies = [
-  dependency('glib-2.0', version: '>= 2.76'),
-  dependency('gobject-2.0'),
-  dependency('gio-2.0'),
-  dependency('gtk4', version: '>= 4.10'),
-  dependency('libadwaita-1', version: '>= 1.4'),
-  dependency('gee-0.8'),
-  meson.get_compiler('vala').find_library('posix'),
-]
+[layout]
+-> src => src
 
-subdir('src')
-subdir('data')
+[build]
+-> link => static
 
-install_data('data/com.protonmanager.App.desktop.in',
-  rename: 'com.protonmanager.App.desktop',
-  install_dir: join_paths(get_option('datadir'), 'applications'),
-)
+[default-build]
+-> profile => release
+-> emit    => bin
+
+[dependencies]
+-> gtk => newest
+
+[system-dependencies]
+-> gtk4
+--> version => >=4.10
+--> pkg-config => gtk4
+--> apt => libgtk-4-dev
+--> dnf => gtk4-devel
+--> pacman => gtk4
+--> apk => gtk4.0-dev
+--> zypper => gtk4-devel
+-> libadwaita
+--> version => >=1.5
+--> pkg-config => libadwaita-1
+--> apt => libadwaita-1-dev
+--> dnf => libadwaita-devel
+--> pacman => libadwaita
+--> apk => libadwaita-dev
+--> zypper => libadwaita-devel
+-> glib
+--> pkg-config => glib-2.0
+--> apt => libglib2.0-dev
+--> dnf => glib2-devel
+--> pacman => glib2
+--> apk => glib-dev
+--> zypper => glib2-devel
+
+[commands]
+-> check
+--> run => bit check
+--> description => Type-check every module
+-> install-local
+--> run => install -Dm755 cache/build/release/proton-manager /usr/local/bin/proton-manager && install -Dm644 data/com.protonmanager.App.desktop.in /usr/local/share/applications/com.protonmanager.App.desktop
+--> description => Install the release binary and the .desktop file into /usr/local
