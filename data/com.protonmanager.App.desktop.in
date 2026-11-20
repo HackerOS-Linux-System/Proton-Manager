@@ -1,1 +1,10 @@
-# Plik .desktop instalowany jest z głównego meson.build.
+[Desktop Entry]
+Type=Application
+Name=Proton Manager
+Comment=Manage Proton/Wine prefixes, protontricks and winetricks for Steam games
+Exec=proton-manager
+Icon=applications-games-symbolic
+Terminal=false
+Categories=Game;Utility;GTK;
+Keywords=proton;wine;winetricks;protontricks;steam;
+StartupWMClass=com.protonmanager.App
