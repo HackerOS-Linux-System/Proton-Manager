@@ -1,0 +1,120 @@
+use "std -> process" from "process"
+use "std -> strings" from "strings"
+use "std -> env" from "env"
+
+mod game
+mod steam_library
+
+;; ── BackendKind ──────────────────────────────────────────────────────────────
+pub fn kind_none()    -> int is return 0 end
+pub fn kind_native()  -> int is return 1 end
+pub fn kind_flatpak() -> int is return 2 end
+
+pub fn detect() -> int is
+    if process::which("protontricks") != "" is
+        return kind_native()
+    end
+    if process::which("flatpak") != "" is
+        let out: string = process::run("flatpak list --app --columns=application 2>/dev/null")
+        if out.contains("com.github.Matoking.protontricks") is
+            return kind_flatpak()
+        end
+    end
+    return kind_none()
+end
+
+pub fn status_text(kind: int) -> string is
+    if kind == kind_native() is
+        return "protontricks: wersja natywna wykryta"
+    end
+    if kind == kind_flatpak() is
+        return "protontricks: wersja Flatpak wykryta"
+    end
+    return "protontricks: nie znaleziono (dostępny tylko tryb bezpośredni)"
+end
+
+;; argv wolajacy protontricks z podanymi argumentami.
+pub fn build_argv(kind: int, args: [string]) -> [string] is
+    let mut argv: [string] = []
+    if kind == kind_flatpak() is
+        argv.push("flatpak")
+        argv.push("run")
+        argv.push("com.github.Matoking.protontricks")
+    else is
+        ;; natywny albo brak — w razie braku i tak sprobuje i zglosi blad uruchomienia
+        argv.push("protontricks")
+    end
+    let mut i: int = 0
+    while i < args.len() is
+        argv.push(args[i])
+        i += 1
+    end
+    return argv
+end
+
+;; ── Tryb awaryjny (bypass) ───────────────────────────────────────────────────
+;; Pomija protontricks i wola wine/winetricks bezposrednio z wybranej instalacji
+;; Proton, wskazujac WINEPREFIX na prefix gry. To ten tryb „naprawia” sytuacje,
+;; w ktorych protontricks sie wiesza, zle wykrywa gre albo w ogole nie dziala.
+
+;; Akcje trybu bezposredniego (zamiast delegatow Vali).
+pub fn act_winecfg()    -> int is return 0 end
+pub fn act_winetricks() -> int is return 1 end   ;; GUI, albo z `extra` = verby
+pub fn act_kill()       -> int is return 2 end
+pub fn act_run_exe()    -> int is return 3 end
+
+fn wine_bin(proton_dir: string) -> string is
+    return proton_dir + "/files/bin/wine"
+end
+
+pub fn winecfg_argv(proton_dir: string) -> [string] is
+    return [wine_bin(proton_dir), "winecfg"]
+end
+
+pub fn winetricks_gui_argv() -> [string] is
+    return ["winetricks"]
+end
+
+;; `verbs` — jeden lub kilka verbow rozdzielonych spacjami (winetricks bierze wiele).
+pub fn winetricks_verb_argv(verbs: string) -> [string] is
+    let mut argv: [string] = ["winetricks"]
+    let parts: [string] = strings::split_whitespace(verbs)
+    let mut i: int = 0
+    while i < parts.len() is
+        argv.push(parts[i])
+        i += 1
+    end
+    return argv
+end
+
+pub fn run_exe_argv(proton_dir: string, exe_path: string) -> [string] is
+    return [wine_bin(proton_dir), exe_path]
+end
+
+pub fn kill_wineserver_argv(proton_dir: string) -> [string] is
+    return [proton_dir + "/files/bin/wineserver", "-k"]
+end
+
+pub fn direct_argv(action: int, proton_dir: string, extra: string) -> [string] is
+    if action == act_winecfg() is return winecfg_argv(proton_dir) end
+    if action == act_kill()    is return kill_wineserver_argv(proton_dir) end
+    if action == act_run_exe() is return run_exe_argv(proton_dir, extra) end
+    if extra == "" is return winetricks_gui_argv() end
+    return winetricks_verb_argv(extra)
+end
+
+;; Zmienne srodowiskowe jako lista "KLUCZ=wartosc".
+pub fn build_env(g: game::Game, proton_dir: string) -> [string] is
+    let steam_root: string = steam_library::find_steam_root()
+    let bin: string = proton_dir + "/files/bin"
+    let path: string = env::get_or("PATH", "/usr/bin")
+    return [
+        "WINEPREFIX=" + game::pfx_path(g),
+        "STEAM_COMPAT_DATA_PATH=" + g.compatdata_path,
+        "STEAM_COMPAT_CLIENT_INSTALL_PATH=" + steam_root,
+        "WINE=" + bin + "/wine",
+        "WINELOADER=" + bin + "/wine",
+        "WINESERVER=" + bin + "/wineserver",
+        "PATH=" + bin + ":" + path,
+    ]
+end
