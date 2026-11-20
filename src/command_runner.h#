@@ -1,0 +1,172 @@
+use "std -> fs" from "fs"
+use "std -> process" from "process"
+use "std -> strings" from "strings"
+use "std -> conv" from "conv"
+
+mod ffi
+
+pub struct Runner is
+    pub active:   [int]
+    pub pid:      [int]
+    pub base:     [string]
+    pub label:    [string]
+    pub out_seen: [int]
+    pub err_seen: [int]
+    pub on_line:  [fn(string, bool) -> void]
+    pub on_done:  [fn(string, int) -> void]
+end
+
+pub fn new_runner() -> Runner is
+    return Runner {
+        active: [], pid: [], base: [], label: [],
+        out_seen: [], err_seen: [], on_line: [], on_done: [],
+    }
+end
+
+;; Cytowanie dla powloki: 'tekst' z ' -> '\''
+pub fn sq(s: string) -> string is
+    return "'" + strings::replace_all(s, "'", "'\\''") + "'"
+end
+
+;; Czy polecenie w ogole istnieje (sciezka bezwzgledna albo w $PATH).
+fn program_exists(prog: string) -> bool is
+    if prog.contains("/") is
+        return ffi::access(prog, 1) == 0
+    end
+    return process::which(prog) != ""
+end
+
+;; Zwraca nowe, KOMPLETNE linie pliku (niedokonczona ostatnia czeka na reszte,
+;; chyba ze `final`). Daje nowa liczbe przetworzonych linii.
+fn drain(path: string, seen: int, final: bool, is_err: bool, cb: fn(string, bool) -> void) -> int is
+    if !fs::exists(path) is return seen end
+    let content: string = fs::read(path)
+    if content == "" is return seen end
+
+    let parts: [string] = strings::split(content, "\n")
+    let mut avail: int = parts.len()
+    ;; split zwraca na koncu pusty element, gdy tekst konczy sie "\n"
+    if content.ends_with("\n") is
+        avail = parts.len() - 1
+    elsif !final is
+        avail = parts.len() - 1
+    end
+
+    let mut i: int = seen
+    while i < avail is
+        let mut line: string = parts[i]
+        if line.ends_with("\r") is
+            line = strings::slice(line, 0, line.len() - 1)
+        end
+        cb(line, is_err)
+        i += 1
+    end
+    if avail > seen is return avail end
+    return seen
+end
+
+;; Startuje polecenie. `env` = lista "KLUCZ=wartosc" (moze byc pusta).
+;; Bledy uruchomienia trafiaja do `on_line(..., true)` i `on_done(label, -1)`.
+pub fn start(r: Runner, argv: [string], env: [string], label: string,
+             on_line: fn(string, bool) -> void, on_done: fn(string, int) -> void) is
+    if argv.len() == 0 || !program_exists(argv[0]) is
+        let mut prog: string = ""
+        if argv.len() > 0 is prog = argv[0] end
+        on_line("Błąd uruchamiania: nie znaleziono polecenia '" + prog + "'", true)
+        on_done(label, -1)
+        return
+    end
+
+    let base: string = fs::temp_file("proton-manager-")
+    let mut cmd: string = "exec env"
+    let mut i: int = 0
+    while i < env.len() is
+        cmd = cmd + " " + sq(env[i])
+        i += 1
+    end
+    i = 0
+    while i < argv.len() is
+        cmd = cmd + " " + sq(argv[i])
+        i += 1
+    end
+
+    let out_f: string = base + ".out"
+    let err_f: string = base + ".err"
+    let done_f: string = base + ".done"
+    let tmp_f: string = base + ".tmp"
+    let mut full: string = "( " + cmd + " ) </dev/null >" + sq(out_f) + " 2>" + sq(err_f)
+    full = full + "; echo $? > " + sq(tmp_f) + " && mv " + sq(tmp_f) + " " + sq(done_f)
+    let pid: int = process::spawn(full)
+
+    ;; ponowne uzycie wolnego slotu
+    let mut slot: int = -1
+    i = 0
+    while i < r.active.len() is
+        if r.active[i] == 0 && slot < 0 is slot = i end
+        i += 1
+    end
+    if slot >= 0 is
+        r.active[slot] = 1
+        r.pid[slot] = pid
+        r.base[slot] = base
+        r.label[slot] = label
+        r.out_seen[slot] = 0
+        r.err_seen[slot] = 0
+        r.on_line[slot] = on_line
+        r.on_done[slot] = on_done
+    else is
+        r.active.push(1)
+        r.pid.push(pid)
+        r.base.push(base)
+        r.label.push(label)
+        r.out_seen.push(0)
+        r.err_seen.push(0)
+        r.on_line.push(on_line)
+        r.on_done.push(on_done)
+    end
+end
+
+fn finish(r: Runner, i: int) is
+    let base: string = r.base[i]
+    let done_f: string = base + ".done"
+    let mut status: int = -1
+    let txt: string = strings::trim(fs::read(done_f))
+    if txt != "" is status = conv::str_to_int(txt) end
+
+    ;; sprzatanie plikow tymczasowych + zebranie zombie powloki
+    fs::remove(base + ".out")
+    fs::remove(base + ".err")
+    fs::remove(done_f)
+    fs::remove(base)
+    ffi::waitpid(r.pid[i], 0, 1)
+
+    r.active[i] = 0
+    let cb = r.on_done[i]
+    cb(r.label[i], status)
+end
+
+;; Jedno przejscie po zadaniach — wolac z timera (np. co 100 ms).
+pub fn tick(r: Runner) is
+    let mut i: int = 0
+    while i < r.active.len() is
+        if r.active[i] == 1 is
+            let base: string = r.base[i]
+            let finished: bool = fs::exists(base + ".done")
+            let line_cb = r.on_line[i]
+            r.out_seen[i] = drain(base + ".out", r.out_seen[i], finished, false, line_cb)
+            r.err_seen[i] = drain(base + ".err", r.err_seen[i], finished, true, line_cb)
+            if finished is finish(r, i) end
+        end
+        i += 1
+    end
+end
+
+pub fn running_count(r: Runner) -> int is
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < r.active.len() is
+        if r.active[i] == 1 is n += 1 end
+        i += 1
+    end
+    return n
+end
