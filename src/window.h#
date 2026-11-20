@@ -1,0 +1,460 @@
+use "bit -> gtk" from "gtk"
+use "std -> strings" from "strings"
+
+mod game
+mod steam_library
+mod protontricks
+mod command_runner
+mod ffi
+
+pub fn app_name() -> string is return "Proton Manager" end
+pub fn app_id()   -> string is return "com.protonmanager.App" end
+pub fn app_version() -> string is return "0.1.0" end
+
+;; ── Stan aplikacji (struktura-referencja wspoldzielona przez domkniecia) ─────
+;; Zasada z README biblioteki gtk: domkniecia tylko CZYTAJA przechwycone wartosci,
+;; a stan zmieniamy wywolujac funkcje na `Ui` (np. `append_log(ui, ...)`).
+
+pub struct Ui is
+    pub app:        gtk::App
+    pub win:        gtk::Window
+    pub title:      gtk::WindowTitle
+    pub search:     gtk::SearchEntry
+    pub list:       gtk::ListBox
+    pub right:      gtk::ScrolledWindow
+    pub empty:      gtk::StatusPage
+    pub log_view:   gtk::TextView
+    pub log_scroll: gtk::ScrolledWindow
+
+    pub games:      [game::Game]
+    pub visible:    [int]            ;; wiersz listy -> indeks w `games`
+    pub selected:   int              ;; indeks w `games` albo -1
+    pub installs:   [string]
+    pub proton_idx: int              ;; zapamietany wybor wersji Protona
+    pub backend:    int
+    pub runner:     command_runner::Runner
+
+    pub panel_root:  int             ;; uchwyt aktualnego panelu akcji (0 = pusty ekran)
+    pub dropdown:    gtk::DropDown
+    pub scroll_left: int             ;; ile jeszcze tikow dosuwac log na dol
+end
+
+;; ── Log ──────────────────────────────────────────────────────────────────────
+
+fn append_log(ui: Ui, text: string, is_error: bool) is
+    let mut line: string = text
+    if is_error is line = "⚠ " + text end
+    ui.log_view.append(line + "\n")
+    ui.scroll_left = 3
+end
+
+;; Rozmiar widoku zmienia sie dopiero w nastepnej klatce, wiec dosuwamy
+;; do konca w kilku kolejnych tikach timera.
+fn scroll_log(ui: Ui) is
+    if ui.scroll_left <= 0 is return end
+    ui.scroll_left -= 1
+    let adj: int = ffi::gtk_scrolled_window_get_vadjustment(ui.log_scroll.handle)
+    let upper: f64 = ffi::gtk_adjustment_get_upper(adj)
+    let page: f64 = ffi::gtk_adjustment_get_page_size(adj)
+    ffi::gtk_adjustment_set_value(adj, upper - page)
+end
+
+fn tick(ui: Ui) is
+    command_runner::tick(ui.runner)
+    scroll_log(ui)
+end
+
+;; ── Uruchamianie polecen ─────────────────────────────────────────────────────
+
+fn run_and_log(ui: Ui, argv: [string], env: [string], label: string) is
+    append_log(ui, "$ " + strings::join(argv, " "), false)
+    command_runner::start(ui.runner, argv, env, label,
+        |line: string, is_err: bool| is append_log(ui, line, is_err) end,
+        |lbl: string, status: int| is
+            append_log(ui, "[" + lbl + "] zakończono (kod " + to_string(status) + ")", status != 0)
+        end)
+end
+
+fn run_protontricks_gui(ui: Ui, g: game::Game) is
+    run_and_log(ui, protontricks::build_argv(ui.backend, ["--gui", g.appid]), [], "protontricks GUI")
+end
+
+fn run_protontricks_verb(ui: Ui, g: game::Game, verb: string) is
+    run_and_log(ui, protontricks::build_argv(ui.backend, [g.appid, verb]), [], "protontricks " + verb)
+end
+
+fn run_protontricks_list_apps(ui: Ui) is
+    run_and_log(ui, protontricks::build_argv(ui.backend, ["--list"]), [], "protontricks --list")
+end
+
+;; Wybrana w liscie instalacja Protona ("" gdy zadnej nie wykryto).
+fn current_proton_dir(ui: Ui) -> string is
+    if ui.installs.len() == 0 is return "" end
+    let mut idx: int = ui.dropdown.selected()
+    if idx < 0 || idx >= ui.installs.len() is idx = 0 end
+    return ui.installs[idx]
+end
+
+fn run_direct(ui: Ui, g: game::Game, label: string, action: int, extra: string) is
+    let proton_dir: string = current_proton_dir(ui)
+    if proton_dir == "" is
+        append_log(ui, "Brak wykrytej instalacji Proton — nie można uruchomić trybu bezpośredniego.", true)
+        return
+    end
+    let argv: [string] = protontricks::direct_argv(action, proton_dir, extra)
+    let env: [string] = protontricks::build_env(g, proton_dir)
+    run_and_log(ui, argv, env, label)
+end
+
+fn install_verbs(ui: Ui, g: game::Game, entry: gtk::Entry) is
+    let verb: string = strings::trim(entry.text())
+    if verb != "" is
+        run_direct(ui, g, "winetricks " + verb, protontricks::act_winetricks(), verb)
+    end
+end
+
+fn open_prefix_folder(ui: Ui, g: game::Game) is
+    if !gtk::open_uri("file://" + game::pfx_path(g)) is
+        append_log(ui, "Nie udało się otworzyć folderu: " + game::pfx_path(g), true)
+    end
+end
+
+;; "" = uzytkownik anulowal okno wyboru pliku
+fn run_exe_file(ui: Ui, g: game::Game, path: string) is
+    if path != "" is
+        run_direct(ui, g, "wine " + path, protontricks::act_run_exe(), path)
+    end
+end
+
+fn choose_and_run_exe(ui: Ui, g: game::Game) is
+    ui.app.open_file(ui.win, "Wybierz plik .exe do uruchomienia w prefixie", "",
+        |path: string| is run_exe_file(ui, g, path) end)
+end
+
+;; ── Panel akcji (prawa strona) ───────────────────────────────────────────────
+
+fn make_action_button(ui: Ui, label: string, icon_name: string, cb: fn() -> void) -> gtk::Button is
+    let btn: gtk::Button = gtk::new_button("")
+    let content: gtk::ButtonContent = gtk::new_button_content(icon_name, label)
+    btn.set_child(content.handle)
+    ui.app.on_click(btn, cb)
+    return btn
+end
+
+fn make_heading(text: string, wrap: bool) -> gtk::Label is
+    let lbl: gtk::Label = gtk::new_label(text)
+    gtk::add_css_class(lbl.handle, "heading")
+    gtk::set_align(lbl.handle, gtk::align_start(), gtk::align_fill())
+    if wrap is lbl.set_wrap(true) end
+    return lbl
+end
+
+fn show_empty(ui: Ui) is
+    if ui.panel_root != 0 is
+        ui.app.unwatch_tree(ui.panel_root)
+        ui.panel_root = 0
+    end
+    ui.right.set_child(ui.empty.handle)
+end
+
+fn build_action_panel(ui: Ui) is
+    if ui.selected < 0 || ui.selected >= ui.games.len() is
+        show_empty(ui)
+        return
+    end
+    if ui.panel_root != 0 is
+        ui.app.unwatch_tree(ui.panel_root)
+        ui.panel_root = 0
+    end
+
+    let g: game::Game = ui.games[ui.selected]
+    let box_: gtk::Box = gtk::vbox(14)
+    gtk::set_margins(box_.handle, 18, 18, 18, 18)
+
+    let title: gtk::Label = gtk::new_label(g.name)
+    gtk::add_css_class(title.handle, "title-1")
+    gtk::set_align(title.handle, gtk::align_start(), gtk::align_fill())
+    title.set_wrap(true)
+    title.set_xalign(0.0)
+    box_.append(title.handle)
+
+    let subtitle: gtk::Label = gtk::new_label(game::display_subtitle(g))
+    gtk::add_css_class(subtitle.handle, "dim-label")
+    gtk::set_align(subtitle.handle, gtk::align_start(), gtk::align_fill())
+    box_.append(subtitle.handle)
+
+    ;; Wybor wersji Proton do trybu bezposredniego (bypass)
+    let proton_label: gtk::Label = gtk::new_label("Wersja Proton (tryb bezpośredni):")
+    gtk::set_align(proton_label.handle, gtk::align_start(), gtk::align_fill())
+    gtk::set_margins(proton_label.handle, 6, 0, 0, 0)
+    box_.append(proton_label.handle)
+
+    let dd: gtk::DropDown = gtk::new_drop_down()
+    if ui.installs.len() == 0 is
+        dd.append("(brak wykrytej instalacji Proton)")
+    else is
+        let mut i: int = 0
+        while i < ui.installs.len() is
+            let parts: [string] = strings::split(ui.installs[i], "/")
+            dd.append(parts[parts.len() - 1])
+            i += 1
+        end
+        if ui.proton_idx >= 0 && ui.proton_idx < ui.installs.len() is
+            dd.set_selected(ui.proton_idx)
+        end
+    end
+    ui.dropdown = dd
+    ui.app.on_dropdown_change(dd, |i: int| is remember_proton(ui, i) end)
+    box_.append(dd.handle)
+
+    box_.append(gtk::new_separator(gtk::orientation_horizontal()).handle)
+
+    ;; ── Poprzez protontricks ────────────────────────────────────────────────
+    box_.append(make_heading("Poprzez protontricks", false).handle)
+
+    box_.append(make_action_button(ui, "Otwórz protontricks (GUI winetricks)", "applications-system-symbolic",
+        || is run_protontricks_gui(ui, g) end).handle)
+    box_.append(make_action_button(ui, "winecfg przez protontricks", "preferences-system-symbolic",
+        || is run_protontricks_verb(ui, g, "winecfg") end).handle)
+    box_.append(make_action_button(ui, "Lista zainstalowanych verbs (protontricks -l)", "view-list-symbolic",
+        || is run_protontricks_list_apps(ui) end).handle)
+
+    box_.append(gtk::new_separator(gtk::orientation_horizontal()).handle)
+
+    ;; ── Tryb bezposredni ────────────────────────────────────────────────────
+    box_.append(make_heading("Tryb bezpośredni (bypass protontricks) — polecane, gdy protontricks zawodzi", true).handle)
+
+    box_.append(make_action_button(ui, "winecfg bezpośrednio", "preferences-system-symbolic",
+        || is run_direct(ui, g, "winecfg", protontricks::act_winecfg(), "") end).handle)
+    box_.append(make_action_button(ui, "winetricks (GUI) bezpośrednio", "applications-system-symbolic",
+        || is run_direct(ui, g, "winetricks", protontricks::act_winetricks(), "") end).handle)
+    box_.append(make_action_button(ui, "Zabij wineserver dla tego prefixu", "process-stop-symbolic",
+        || is run_direct(ui, g, "wineserver -k", protontricks::act_kill(), "") end).handle)
+    box_.append(make_action_button(ui, "Otwórz folder prefixu w menedżerze plików", "folder-open-symbolic",
+        || is open_prefix_folder(ui, g) end).handle)
+
+    let verb_box: gtk::Box = gtk::hbox(6)
+    let verb_entry: gtk::Entry = gtk::new_entry("np. vcrun2019, corefonts, d3dx9…")
+    gtk::set_expand(verb_entry.handle, true, false)
+    let verb_btn: gtk::Button = gtk::new_button("Zainstaluj verb (bezpośrednio)")
+    gtk::add_css_class(verb_btn.handle, "suggested-action")
+    ui.app.on_click(verb_btn, || is install_verbs(ui, g, verb_entry) end)
+    ui.app.on_submit(verb_entry, || is install_verbs(ui, g, verb_entry) end)
+    verb_box.append(verb_entry.handle)
+    verb_box.append(verb_btn.handle)
+    box_.append(verb_box.handle)
+
+    let exe_box: gtk::Box = gtk::hbox(6)
+    let exe_btn: gtk::Button = gtk::new_button("Uruchom plik .exe w prefixie…")
+    ui.app.on_click(exe_btn, || is choose_and_run_exe(ui, g) end)
+    exe_box.append(exe_btn.handle)
+    box_.append(exe_box.handle)
+
+    ui.panel_root = box_.handle
+    ui.right.set_child(box_.handle)
+end
+
+fn remember_proton(ui: Ui, idx: int) is
+    ui.proton_idx = idx
+end
+
+;; ── Lista gier (lewa strona) ─────────────────────────────────────────────────
+
+fn make_row(g: game::Game) -> gtk::Box is
+    let box_: gtk::Box = gtk::vbox(2)
+    gtk::set_margins(box_.handle, 8, 8, 10, 10)
+
+    let name_label: gtk::Label = gtk::new_label(g.name)
+    gtk::set_align(name_label.handle, gtk::align_start(), gtk::align_fill())
+    name_label.set_xalign(0.0)
+    name_label.set_ellipsize(gtk::ellipsize_end())
+
+    let sub_label: gtk::Label = gtk::new_label(game::display_subtitle(g))
+    gtk::add_css_class(sub_label.handle, "dim-label")
+    gtk::add_css_class(sub_label.handle, "caption")
+    gtk::set_align(sub_label.handle, gtk::align_start(), gtk::align_fill())
+    sub_label.set_xalign(0.0)
+
+    box_.append(name_label.handle)
+    box_.append(sub_label.handle)
+    return box_
+end
+
+;; Przebudowuje liste wg frazy z pola szukania (filtr po nazwie, bez wielkosci liter).
+fn fill_list(ui: Ui) is
+    let query: string = strings::to_lower(ui.search.text())
+    ui.list.clear()
+    ui.visible = []
+    let mut sel_row: int = -1
+    let mut i: int = 0
+    while i < ui.games.len() is
+        let g: game::Game = ui.games[i]
+        if query == "" || strings::to_lower(g.name).contains(query) is
+            ui.list.append(make_row(g).handle)
+            if i == ui.selected is sel_row = ui.visible.len() end
+            ui.visible.push(i)
+        end
+        i += 1
+    end
+    if sel_row >= 0 is ui.list.select_index(sel_row) end
+end
+
+fn on_row_selected(ui: Ui, row: int) is
+    ;; -1 pojawia sie po przebudowie listy filtrem — wybor gry zostaje (jak w GTK)
+    if row < 0 || row >= ui.visible.len() is return end
+    let gi: int = ui.visible[row]
+    if gi == ui.selected && ui.panel_root != 0 is return end
+    ui.selected = gi
+    build_action_panel(ui)
+end
+
+fn reload_games(ui: Ui) is
+    ui.games = steam_library::find_proton_games()
+    ui.installs = steam_library::find_proton_installations()
+    ui.backend = protontricks::detect()
+    ui.title.set_subtitle(protontricks::status_text(ui.backend))
+    ui.selected = -1
+    show_empty(ui)
+    fill_list(ui)
+    let summary: string = "Znaleziono " + to_string(ui.games.len()) + " gier z prefixem Proton, "
+    append_log(ui, summary + to_string(ui.installs.len()) + " instalacji Protona.", false)
+end
+
+fn show_about(ui: Ui) is
+    gtk::show_about_dialog(ui.win, app_name(), "applications-games-symbolic",
+        "Proton Manager Contributors", app_version(),
+        "Nakładka na protontricks i Proton, ułatwiająca zarządzanie prefixami Wine/Proton oraz omijająca problemy protontricks trybem bezpośrednim.",
+        "", "", "", "", gtk::license_gpl_3_0())
+end
+
+;; ── Budowa okna ──────────────────────────────────────────────────────────────
+
+pub fn run() is
+    ffi::g_set_prgname(app_id())
+    ffi::g_set_application_name(app_name())
+    gtk::init_gtk()
+    gtk::init_adw()
+
+    let win: gtk::Window = gtk::new_adw_window(app_name(), 980, 640)
+    let toolbar: gtk::ToolbarView = gtk::new_toolbar_view()
+    let header: gtk::AdwHeaderBar = gtk::new_adw_header_bar()
+    let title: gtk::WindowTitle = gtk::new_window_title(app_name(), "")
+    header.set_title_widget(title.handle)
+
+    let refresh_btn: gtk::Button = gtk::new_icon_button("view-refresh-symbolic")
+    gtk::set_tooltip(refresh_btn.handle, "Odśwież listę gier")
+    header.pack_start(refresh_btn.handle)
+
+    ;; Menu „O programie” — popover z jednym przyciskiem (zamiast GMenu + akcji GAction)
+    let menu_btn: gtk::MenuButton = gtk::new_menu_button("")
+    menu_btn.set_icon_name("open-menu-symbolic")
+    let pop: gtk::Popover = gtk::new_popover()
+    let pop_box: gtk::Box = gtk::vbox(0)
+    gtk::set_margin(pop_box.handle, 4)
+    let about_btn: gtk::Button = gtk::new_button("O programie")
+    about_btn.set_has_frame(false)
+    pop_box.append(about_btn.handle)
+    pop.set_child(pop_box.handle)
+    menu_btn.set_popover(pop)
+    header.pack_end(menu_btn.handle)
+
+    toolbar.add_top_bar(header.handle)
+
+    ;; Lewy panel: szukajka + lista
+    let search: gtk::SearchEntry = gtk::new_search_entry()
+    search.set_placeholder("Szukaj gry…")
+    gtk::set_expand(search.handle, true, false)
+    let search_box: gtk::Box = gtk::hbox(6)
+    gtk::set_margins(search_box.handle, 6, 6, 8, 8)
+    search_box.append(search.handle)
+
+    let list: gtk::ListBox = gtk::new_list_box()
+    list.set_selection_mode(1)
+    gtk::add_css_class(list.handle, "navigation-sidebar")
+
+    let list_scroll: gtk::ScrolledWindow = gtk::new_scrolled_window()
+    list_scroll.set_child(list.handle)
+    gtk::set_size(list_scroll.handle, 300, -1)
+    gtk::set_expand(list_scroll.handle, false, true)
+
+    let left_box: gtk::Box = gtk::vbox(0)
+    left_box.append(search_box.handle)
+    left_box.append(gtk::new_separator(gtk::orientation_horizontal()).handle)
+    left_box.append(list_scroll.handle)
+
+    ;; Prawy panel: ekran „Wybierz grę” (potem panel akcji)
+    let empty: gtk::StatusPage = gtk::new_status_page("applications-games-symbolic", "Wybierz grę",
+        "Wybierz z listy grę, aby zobaczyć dostępne narzędzia i naprawy prefixu Proton.")
+    gtk::set_expand(empty.handle, false, true)
+    gtk::keep(empty.handle)
+
+    let right: gtk::ScrolledWindow = gtk::new_scrolled_window()
+    right.set_child(empty.handle)
+    gtk::set_expand(right.handle, true, true)
+
+    let paned_top: gtk::Paned = gtk::new_paned(gtk::orientation_horizontal())
+    paned_top.set_start(left_box.handle)
+    paned_top.set_end(right.handle)
+    ffi::gtk_paned_set_resize_start_child(paned_top.handle, 0)
+    ffi::gtk_paned_set_shrink_start_child(paned_top.handle, 0)
+    paned_top.set_position(300)
+    gtk::set_expand(paned_top.handle, false, true)
+
+    ;; Konsola logow (dol)
+    let log_view: gtk::TextView = gtk::new_text_view()
+    log_view.set_editable(false)
+    log_view.set_monospace(true)
+    ffi::gtk_text_view_set_top_margin(log_view.handle, 6)
+    ffi::gtk_text_view_set_left_margin(log_view.handle, 8)
+    let log_scroll: gtk::ScrolledWindow = gtk::new_scrolled_window()
+    log_scroll.set_child(log_view.handle)
+    log_scroll.set_min_height(140)
+    gtk::set_expand(log_scroll.handle, true, false)
+
+    let log_frame: gtk::Frame = gtk::new_frame("")
+    ffi::gtk_frame_set_label_widget(log_frame.handle, 0)   ;; Gtk.Frame (null) — bez miejsca na etykiete
+    log_frame.set_child(log_scroll.handle)
+    gtk::set_margins(log_frame.handle, 0, 8, 8, 8)
+
+    let log_label: gtk::Label = gtk::new_label("Log poleceń:")
+    gtk::set_align(log_label.handle, gtk::align_start(), gtk::align_fill())
+    gtk::set_margins(log_label.handle, 0, 0, 8, 0)
+    gtk::add_css_class(log_label.handle, "heading")
+
+    let bottom_box: gtk::Box = gtk::vbox(4)
+    bottom_box.append(log_label.handle)
+    bottom_box.append(log_frame.handle)
+
+    let main_paned: gtk::Paned = gtk::new_paned(gtk::orientation_vertical())
+    main_paned.set_start(paned_top.handle)
+    main_paned.set_end(bottom_box.handle)
+    ffi::gtk_paned_set_resize_end_child(main_paned.handle, 0)
+    main_paned.set_position(420)
+    gtk::set_expand(main_paned.handle, true, true)
+
+    toolbar.set_content(main_paned.handle)
+    win.set_content(toolbar.handle)
+
+    let app: gtk::App = gtk::new_app()
+    let ui: Ui = Ui {
+        app: app, win: win, title: title, search: search, list: list,
+        right: right, empty: empty, log_view: log_view, log_scroll: log_scroll,
+        games: [], visible: [], selected: -1, installs: [], proton_idx: 0,
+        backend: protontricks::kind_none(), runner: command_runner::new_runner(),
+        panel_root: 0, dropdown: gtk::new_drop_down(), scroll_left: 0,
+    }
+
+    app.on_click(refresh_btn, || is reload_games(ui) end)
+    app.on_click(about_btn, || is
+        pop.popdown()
+        show_about(ui)
+    end)
+    app.on_change(search.as_entry(), |text: string| is fill_list(ui) end)
+    app.on_selection_change(list, |row: int| is on_row_selected(ui, row) end)
+    app.every(100, || is tick(ui) end)
+    app.on_window_close(win, || is app.quit() end)
+
+    reload_games(ui)
+    win.present()
+    app.run()
+end
