@@ -1,0 +1,181 @@
+use "std -> fs" from "fs"
+use "std -> strings" from "strings"
+use "std -> env" from "env"
+
+mod game
+mod ffi
+
+fn contains_str(arr: [string], s: string) -> bool is
+    let mut i: int = 0
+    while i < arr.len() is
+        if arr[i] == s is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Pierwsza wartosc klucza z pliku VDF/ACF: linia `"klucz"<tab><tab>"wartosc"`.
+;; Podzial po `"` daje ["", klucz, "\t\t", wartosc, ""] — pelny parser VDF zbedny.
+fn extract_field(content: string, key: string) -> string is
+    let lines: [string] = strings::split(content, "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        let parts: [string] = strings::split(lines[i], "\"")
+        if parts.len() >= 4 && parts[1] == key is
+            return parts[3]
+        end
+        i += 1
+    end
+    return ""
+end
+
+;; Katalog glowny Steama albo "" gdy nie znaleziono.
+pub fn find_steam_root() -> string is
+    let home: string = env::home()
+    let candidates: [string] = [
+        home + "/.steam/steam",
+        home + "/.local/share/Steam",
+        home + "/.var/app/com.valvesoftware.Steam/.local/share/Steam",
+    ]
+    let mut i: int = 0
+    while i < candidates.len() is
+        if fs::is_dir(candidates[i] + "/steamapps") is
+            return candidates[i]
+        end
+        i += 1
+    end
+    return ""
+end
+
+;; Lista katalogow .../steamapps dla wszystkich bibliotek
+;; (glowna + dodatkowe dyski, wg libraryfolders.vdf).
+pub fn find_library_folders() -> [string] is
+    let mut result: [string] = []
+    let root: string = find_steam_root()
+    if root == "" is return result end
+
+    let main_steamapps: string = root + "/steamapps"
+    result.push(main_steamapps)
+
+    let vdf_path: string = main_steamapps + "/libraryfolders.vdf"
+    if !fs::is_file(vdf_path) is return result end
+    let content: string = fs::read(vdf_path)
+
+    let lines: [string] = strings::split(content, "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        let parts: [string] = strings::split(lines[i], "\"")
+        if parts.len() >= 4 && parts[1] == "path" is
+            let p: string = strings::replace_all(parts[3], "\\\\", "/")
+            let steamapps: string = p + "/steamapps"
+            if fs::is_dir(steamapps) && !contains_str(result, steamapps) is
+                result.push(steamapps)
+            end
+        end
+        i += 1
+    end
+    return result
+end
+
+;; Sortowanie po nazwie (kolejnosc bajtowa, jak strcmp w oryginale).
+fn sort_games(games: [game::Game]) -> [game::Game] is
+    let mut i: int = 1
+    while i < games.len() is
+        let cur: game::Game = games[i]
+        let mut j: int = i - 1
+        while j >= 0 && games[j].name > cur.name is
+            games[j + 1] = games[j]
+            j -= 1
+        end
+        games[j + 1] = cur
+        i += 1
+    end
+    return games
+end
+
+;; Skanuje appmanifest_*.acf i zwraca gry, ktore maja folder compatdata
+;; (czyli byly kiedys uruchomione pod Protonem).
+pub fn find_proton_games() -> [game::Game] is
+    let mut games: [game::Game] = []
+    let libs: [string] = find_library_folders()
+
+    let mut li: int = 0
+    while li < libs.len() is
+        let steamapps: string = libs[li]
+        li += 1
+        if !fs::is_dir(steamapps) is continue end
+
+        let names: [string] = fs::list_dir(steamapps)
+        let mut ni: int = 0
+        while ni < names.len() is
+            let fname: string = names[ni]
+            ni += 1
+            if !fname.starts_with("appmanifest_") || !fname.ends_with(".acf") is continue end
+
+            let full: string = steamapps + "/" + fname
+            if !fs::is_file(full) is continue end
+            let content: string = fs::read(full)
+
+            let appid: string = extract_field(content, "appid")
+            let name: string = extract_field(content, "name")
+            let installdir: string = extract_field(content, "installdir")
+            if appid == "" || name == "" is continue end
+
+            let mut g: game::Game = game::new_game(appid, name, steamapps)
+            if installdir != "" is
+                g.install_dir = steamapps + "/common/" + installdir
+            end
+            if g.has_prefix is games.push(g) end
+        end
+    end
+
+    return sort_games(games)
+end
+
+fn is_proton_dir(candidate: string) -> bool is
+    return ffi::access(candidate + "/files/bin/wine", 1) == 0
+end
+
+;; Zainstalowane wersje Protona: steamapps/common/Proton* we wszystkich
+;; bibliotekach oraz (rozszerzenie) compatibilitytools.d — tam trafia GE-Proton.
+pub fn find_proton_installations() -> [string] is
+    let mut result: [string] = []
+
+    let libs: [string] = find_library_folders()
+    let mut li: int = 0
+    while li < libs.len() is
+        let common: string = libs[li] + "/common"
+        li += 1
+        if !fs::is_dir(common) is continue end
+        let names: [string] = fs::list_dir(common)
+        let mut ni: int = 0
+        while ni < names.len() is
+            let fname: string = names[ni]
+            ni += 1
+            if fname.starts_with("Proton") is
+                let candidate: string = common + "/" + fname
+                if is_proton_dir(candidate) && !contains_str(result, candidate) is
+                    result.push(candidate)
+                end
+            end
+        end
+    end
+
+    let root: string = find_steam_root()
+    if root != "" is
+        let tools: string = root + "/compatibilitytools.d"
+        if fs::is_dir(tools) is
+            let names: [string] = fs::list_dir(tools)
+            let mut ni: int = 0
+            while ni < names.len() is
+                let candidate: string = tools + "/" + names[ni]
+                ni += 1
+                if is_proton_dir(candidate) && !contains_str(result, candidate) is
+                    result.push(candidate)
+                end
+            end
+        end
+    end
+
+    return result
+end
