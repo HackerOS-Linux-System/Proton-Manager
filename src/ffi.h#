@@ -1,0 +1,26 @@
+extern static [c] is
+    fn access(path: string, mode: int) -> int
+    fn waitpid(pid: int, status: int, options: int) -> int
+end
+
+extern static [c, "glib-2.0"] is
+    fn g_set_prgname(name: string)
+    fn g_set_application_name(name: string)
+end
+
+extern static [c, "gtk4"] is
+    fn gtk_paned_set_resize_start_child(paned: int, resize: int)
+    fn gtk_paned_set_shrink_start_child(paned: int, shrink: int)
+    fn gtk_paned_set_resize_end_child(paned: int, resize: int)
+    fn gtk_paned_set_shrink_end_child(paned: int, shrink: int)
+
+    fn gtk_scrolled_window_get_vadjustment(window: int) -> int
+    fn gtk_adjustment_get_upper(adjustment: int) -> f64
+    fn gtk_adjustment_get_page_size(adjustment: int) -> f64
+    fn gtk_adjustment_set_value(adjustment: int, value: f64)
+
+    fn gtk_frame_set_label_widget(frame: int, widget: int)
+    fn gtk_text_view_set_top_margin(view: int, margin: int)
+    fn gtk_text_view_set_left_margin(view: int, margin: int)
+
+end
